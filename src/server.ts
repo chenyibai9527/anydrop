@@ -187,7 +187,7 @@ function getLocalIP() {
   return 'localhost';
 }
 
-httpServer.listen(PORT, () => {
+httpServer.listen(Number(PORT), '0.0.0.0', () => {
   const localIP = getLocalIP();
   console.log(`服务器运行在:`);
   console.log(`- 本地访问: http://localhost:${PORT}`);
