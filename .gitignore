@@ -1,0 +1,29 @@
+# Node.js
+node_modules/
+
+# TypeScript
+*.tsbuildinfo
+
+# 编译输出
+dist/
+
+# 临时文件
+temp/
+
+# 日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 环境变量
+.env
+.env.*
+
+# Mac系统文件
+.DS_Store
+
+# VSCode设置
+.vscode/
+
+# 其他
+*.log 
