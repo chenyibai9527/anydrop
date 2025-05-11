@@ -30,6 +30,9 @@ app.use(express.static(path.join(__dirname, '../public')));
 // 存储连接的设备信息
 const devices = new Map<string, DeviceInfo>();
 
+// 新增：基于公网IP分组
+const ipGroups = new Map<string, Set<string>>();
+
 // 清理过期设备
 function cleanupDevices() {
   const now = Date.now();
@@ -52,15 +55,31 @@ io.on('connection', (socket) => {
     devices.delete(socket.id);
   }
 
-  // 发送设备信息
+  // 获取公网IP（兼容代理）
+  const ip = socket.handshake.headers['x-forwarded-for']?.toString().split(',')[0].trim() || socket.handshake.address;
+  console.log('新连接IP:', ip, 'SocketID:', socket.id);
+
+  // 判断是否为内网IP
+  function isPrivateIP(ip: string) {
+    return /^10\./.test(ip) ||
+           /^192\.168\./.test(ip) ||
+           /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip);
+  }
+  const groupKey = isPrivateIP(ip) ? 'LAN' : ip;
+  if (!ipGroups.has(groupKey)) ipGroups.set(groupKey, new Set());
+  ipGroups.get(groupKey)!.add(socket.id);
+
+  // 只发送同组下的设备信息
   socket.emit('device-info', {
     id: socket.id,
-    devices: Array.from(devices.values())
+    devices: Array.from(ipGroups.get(groupKey)!).filter(id => id !== socket.id).map(id => devices.get(id)).filter(Boolean)
   });
 
-  // 广播新设备加入
-  socket.broadcast.emit('device-joined', {
-    id: socket.id
+  // 广播新设备加入（只广播给同组下的其他设备）
+  ipGroups.get(groupKey)!.forEach(id => {
+    if (id !== socket.id) {
+      io.to(id).emit('device-joined', { id: socket.id });
+    }
   });
 
   // 存储设备信息
@@ -77,19 +96,22 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 处理设备信息
+  // 修改所有 io.emit 为只对同组广播
+  // 设备信息变更
   socket.on('device-info', (data: { type: string; icon: string; name: string }) => {
     const deviceInfo = devices.get(socket.id);
     if (deviceInfo) {
       deviceInfo.type = data.type;
       deviceInfo.icon = data.icon;
       deviceInfo.name = data.name;
-      // 广播设备信息变更
-      io.emit('device-info-update', {
-        id: socket.id,
-        type: data.type,
-        icon: data.icon,
-        name: data.name
+      // 只通知同组
+      ipGroups.get(groupKey)!.forEach(id => {
+        io.to(id).emit('device-info-update', {
+          id: socket.id,
+          type: data.type,
+          icon: data.icon,
+          name: data.name
+        });
       });
     }
   });
@@ -162,12 +184,31 @@ io.on('connection', (socket) => {
     });
   });
 
+  // WebRTC 信令消息转发
+  socket.on('signal', (data: { targetId: string; signal: any }) => {
+    io.to(data.targetId).emit('signal', {
+      fromId: socket.id,
+      signal: data.signal
+    });
+  });
+
+  // P2P失败事件转发
+  socket.on('p2p-failed', (data: { targetId: string; transferId: string }) => {
+    io.to(data.targetId).emit('p2p-failed', {
+      fromId: socket.id,
+      transferId: data.transferId
+    });
+  });
+
   // 处理断开连接
   socket.on('disconnect', () => {
     console.log('设备已断开:', socket.id);
     devices.delete(socket.id);
-    io.emit('device-left', {
-      id: socket.id
+    ipGroups.get(groupKey)?.delete(socket.id);
+    if (ipGroups.get(groupKey)?.size === 0) ipGroups.delete(groupKey);
+    // 只通知同组
+    ipGroups.get(groupKey)?.forEach(id => {
+      io.to(id).emit('device-left', { id: socket.id });
     });
   });
 });

@@ -3266,17 +3266,17 @@
       // 检查是否是合法的响应
       if (transfer && fromId === targetId) {
         if (accepted) {
-          debugLog('SEND', `目标设备已接受文件传输请求，开始发送数据`, { transferId, targetId });
+          debugLog('SEND', `目标设备已接受文件传输请求，开始建立P2P连接`, { transferId, targetId });
           
           // 更新传输状态
-          transfer.status = 'active';
+          transfer.status = 'connecting';
           activeTransfers.set(transferId, transfer);
           
           // 显示传输进度
           showTransferProgress(transferId);
           
-          // 开始传输文件数据
-          sendFileData(transfer.file, targetId, transferId);
+          // 开始建立WebRTC连接
+          startWebRTCConnection(targetId, transferId);
         } else {
           debugLog('SEND', `目标设备拒绝了文件传输请求`, { transferId, targetId });
           
@@ -3307,6 +3307,362 @@
       
       // 保存折叠状态到本地存储
       localStorage.setItem('deviceListCollapsed', footer.classList.contains('collapsed'));
+    });
+
+    // ===== WebRTC P2P 直连基础逻辑 =====
+    let peer = null;
+    let dataChannel = null;
+    let remoteSocketId = null; // 目标设备socket.id
+
+    // 发起P2P连接（A端）
+    function startWebRTCConnection(targetId, transferId) {
+      remoteSocketId = targetId;
+      peer = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' }
+        ]
+      });
+
+      // 创建数据通道
+      dataChannel = peer.createDataChannel('file', {
+        ordered: true,
+        maxRetransmits: 3
+      });
+
+      // 设置数据通道事件处理
+      setupDataChannel(dataChannel, transferId);
+
+      // 处理ICE候选
+      peer.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit('signal', { 
+            targetId, 
+            signal: { 
+              candidate: event.candidate,
+              transferId // 添加transferId以关联传输
+            } 
+          });
+        }
+      };
+
+      // 处理连接状态变化
+      peer.onconnectionstatechange = () => {
+        debugLog('P2P', `连接状态变化: ${peer.connectionState}`, { transferId });
+        if (peer.connectionState === 'connected') {
+          // 连接建立成功，开始传输文件
+          const transfer = activeTransfers.get(transferId);
+          if (transfer) {
+            transfer.status = 'active';
+            activeTransfers.set(transferId, transfer);
+            sendFileOverDataChannel(transfer.file, transferId);
+          }
+        } else if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
+          // 连接失败，尝试降级到服务器中转
+          fallbackToServerTransfer(transferId);
+        }
+      };
+
+      // 创建并发送offer
+      peer.createOffer().then(offer => {
+        peer.setLocalDescription(offer);
+        socket.emit('signal', { 
+          targetId, 
+          signal: { 
+            sdp: offer,
+            transferId // 添加transferId以关联传输
+          } 
+        });
+      }).catch(error => {
+        debugLog('P2P ERROR', '创建offer失败', error);
+        fallbackToServerTransfer(transferId);
+      });
+    }
+
+    // 设置数据通道事件处理
+    function setupDataChannel(channel, transferId) {
+      channel.onopen = () => {
+        debugLog('P2P', '数据通道已打开', { transferId });
+      };
+
+      channel.onclose = () => {
+        debugLog('P2P', '数据通道已关闭', { transferId });
+      };
+
+      channel.onerror = (error) => {
+        debugLog('P2P ERROR', '数据通道错误', error);
+        fallbackToServerTransfer(transferId);
+      };
+    }
+
+    // 通过DataChannel发送文件
+    function sendFileOverDataChannel(file, transferId) {
+      const chunkSize = 64 * 1024; // 64KB
+      let offset = 0;
+      let lastUpdateTime = Date.now();
+      
+      function readNextChunk() {
+        const transfer = activeTransfers.get(transferId);
+        if (!transfer || transfer.status !== 'active') {
+          debugLog('SEND', `传输 ${transferId} 已停止或取消`);
+          return;
+        }
+        
+        const chunk = file.slice(offset, offset + chunkSize);
+        const reader = new FileReader();
+        
+        reader.onload = (e) => {
+          // 再次检查传输状态
+          const transfer = activeTransfers.get(transferId);
+          if (!transfer || transfer.status !== 'active') {
+            return;
+          }
+          
+          debugLog('SEND', `发送数据块 ${Math.round((offset / file.size) * 100)}%`, {
+            transferId,
+            offset,
+            chunkSize: chunk.size
+          });
+          
+          // 通过DataChannel发送数据
+          if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(e.target.result);
+          } else {
+            debugLog('SEND ERROR', 'DataChannel未就绪');
+            fallbackToServerTransfer(transferId);
+            return;
+          }
+          
+          offset += chunk.size;
+          
+          // 更新进度
+          if (transfer) {
+            const now = Date.now();
+            transfer.progress = (offset / file.size) * 100;
+            
+            // 计算速度（每 500ms 更新一次）
+            if (now - lastUpdateTime > 500) {
+              const elapsedTime = (now - transfer.startTime) / 1000; // 秒
+              if (elapsedTime > 0) {
+                transfer.speed = offset / elapsedTime; // 字节/秒
+              }
+              lastUpdateTime = now;
+              updateTransferProgress(transferId);
+            }
+            
+            activeTransfers.set(transferId, transfer);
+          }
+          
+          if (offset < file.size) {
+            // 使用setTimeout添加小延迟，避免短时间内发送过多数据
+            setTimeout(readNextChunk, 10);
+          } else {
+            // 传输完成
+            debugLog('SEND', `文件 ${file.name} 传输完成`);
+            const transfer = activeTransfers.get(transferId);
+            if (transfer) {
+              transfer.progress = 100;
+              transfer.status = 'completed';
+              activeTransfers.set(transferId, transfer);
+              updateTransferProgress(transferId);
+            }
+            showNotification(`文件 ${file.name} 传输完成`);
+            
+            // 几秒后移除进度条
+            setTimeout(() => {
+              document.getElementById(`send-${transferId}`)?.remove();
+            }, 3000);
+          }
+        };
+        
+        reader.onerror = (err) => {
+          debugLog('SEND ERROR', `读取文件块出错: ${err}`);
+          fallbackToServerTransfer(transferId);
+        };
+        
+        reader.readAsArrayBuffer(chunk);
+      }
+      
+      readNextChunk();
+    }
+
+    // 降级到服务器中转传输
+    function fallbackToServerTransfer(transferId) {
+      const transfer = activeTransfers.get(transferId);
+      if (!transfer) return;
+
+      debugLog('FALLBACK', '降级到服务器中转传输', { transferId });
+      
+      // 更新传输状态
+      transfer.status = 'active';
+      activeTransfers.set(transferId, transfer);
+      
+      // 开始服务器中转传输
+      sendFileData(transfer.file, transfer.targetId, transferId);
+    }
+
+    // 监听信令消息（A/B端）
+    socket.on('signal', async ({ fromId, signal }) => {
+      const transferId = signal.transferId;
+      remoteSocketId = fromId;
+      
+      if (!peer) {
+        peer = new RTCPeerConnection({
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' }
+          ]
+        });
+
+        // 监听数据通道
+        peer.ondatachannel = (event) => {
+          dataChannel = event.channel;
+          setupReceiveDataChannel(dataChannel, transferId);
+        };
+
+        // 处理ICE候选
+        peer.onicecandidate = (event) => {
+          if (event.candidate) {
+            socket.emit('signal', { 
+              targetId: fromId, 
+              signal: { 
+                candidate: event.candidate,
+                transferId
+              } 
+            });
+          }
+        };
+
+        // 处理连接状态变化
+        peer.onconnectionstatechange = () => {
+          debugLog('P2P', `连接状态变化: ${peer.connectionState}`, { transferId });
+          if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
+            // 连接失败，通知发送方降级到服务器中转
+            socket.emit('p2p-failed', { targetId: fromId, transferId });
+          }
+        };
+      }
+
+      try {
+        if (signal.sdp) {
+          await peer.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+          if (signal.sdp.type === 'offer') {
+            const answer = await peer.createAnswer();
+            await peer.setLocalDescription(answer);
+            socket.emit('signal', { 
+              targetId: fromId, 
+              signal: { 
+                sdp: answer,
+                transferId
+              } 
+            });
+          }
+        }
+        if (signal.candidate) {
+          await peer.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        }
+      } catch (error) {
+        debugLog('P2P ERROR', '处理信令消息失败', error);
+        socket.emit('p2p-failed', { targetId: fromId, transferId });
+      }
+    });
+
+    // 设置接收数据通道
+    function setupReceiveDataChannel(channel, transferId) {
+      const receiver = fileReceivers.get(transferId);
+      if (!receiver) {
+        debugLog('P2P ERROR', '未找到对应的接收状态', { transferId });
+        return;
+      }
+
+      channel.onopen = () => {
+        debugLog('P2P', '接收数据通道已打开', { transferId });
+        receiver.active = true;
+        fileReceivers.set(transferId, receiver);
+      };
+
+      channel.onclose = () => {
+        debugLog('P2P', '接收数据通道已关闭', { transferId });
+        receiver.active = false;
+        fileReceivers.set(transferId, receiver);
+      };
+
+      channel.onerror = (error) => {
+        debugLog('P2P ERROR', '接收数据通道错误', error);
+        socket.emit('p2p-failed', { targetId: remoteSocketId, transferId });
+      };
+
+      channel.onmessage = (event) => {
+        try {
+          const receiver = fileReceivers.get(transferId);
+          if (!receiver || !receiver.active) {
+            debugLog('P2P', '接收已停止，忽略数据', { transferId });
+            return;
+          }
+
+          // 处理接收到的数据
+          const chunk = event.data;
+          let chunkSize = 0;
+
+          // 尝试确定数据大小
+          if (chunk.byteLength !== undefined) {
+            chunkSize = chunk.byteLength;
+          } else if (chunk.length !== undefined) {
+            chunkSize = chunk.length;
+          } else {
+            debugLog('P2P', '无法确定数据块大小，使用估算值');
+            chunkSize = 1024; // 估算值
+          }
+
+          // 添加数据块
+          receiver.chunks.push(chunk);
+          receiver.receivedSize += chunkSize;
+
+          // 计算进度
+          const progress = (receiver.receivedSize / receiver.fileSize) * 100;
+
+          // 更新UI进度
+          updateReceiveProgressUI(transferId, progress);
+
+          // 检查是否接收完成（允许1KB误差）
+          if (Math.abs(receiver.receivedSize - receiver.fileSize) <= 1024) {
+            debugLog('P2P', '文件接收完成', {
+              fileName: receiver.fileName,
+              receivedSize: receiver.receivedSize,
+              fileSize: receiver.fileSize
+            });
+
+            // 更新UI为完成状态
+            updateReceiveProgressUI(transferId, 100, 'completed');
+
+            // 保存文件
+            saveReceivedFile(transferId);
+          }
+        } catch (error) {
+          debugLog('P2P ERROR', '处理接收数据失败', error);
+          socket.emit('p2p-failed', { targetId: remoteSocketId, transferId });
+        }
+      };
+    }
+
+    // 监听P2P失败事件
+    socket.on('p2p-failed', (data) => {
+      const { fromId, transferId } = data;
+      debugLog('P2P', '收到P2P失败通知', { fromId, transferId });
+
+      // 如果是发送方
+      if (activeTransfers.has(transferId)) {
+        fallbackToServerTransfer(transferId);
+      }
+      // 如果是接收方
+      else if (fileReceivers.has(transferId)) {
+        const receiver = fileReceivers.get(transferId);
+        receiver.active = false;
+        fileReceivers.set(transferId, receiver);
+        showNotification('P2P连接失败，切换到服务器中转');
+      }
     });
   </script>
 </body>
