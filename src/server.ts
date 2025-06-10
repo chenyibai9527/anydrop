@@ -47,6 +47,31 @@ function cleanupDevices() {
 // 定期清理过期设备
 setInterval(cleanupDevices, 10000);
 
+// 判断是否为内网IP
+function isPrivateIP(ip: string) {
+  return /^10\./.test(ip) ||
+         /^192\.168\./.test(ip) ||
+         /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip);
+}
+
+// 获取设备所属的网络组
+function getNetworkGroup(ip: string) {
+  if (isPrivateIP(ip)) {
+    // 对于内网IP，提取网段作为组标识
+    const parts = ip.split('.');
+    if (parts[0] === '10') {
+      return 'LAN-10';
+    } else if (parts[0] === '192' && parts[1] === '168') {
+      return 'LAN-192.168';
+    } else if (parts[0] === '172') {
+      return 'LAN-172';
+    }
+  }
+  // 对于公网IP，使用IP的前三段作为组标识
+  const parts = ip.split('.');
+  return parts.slice(0, 3).join('.');
+}
+
 io.on('connection', (socket) => {
   console.log('设备已连接:', socket.id);
 
@@ -59,13 +84,8 @@ io.on('connection', (socket) => {
   const ip = socket.handshake.headers['x-forwarded-for']?.toString().split(',')[0].trim() || socket.handshake.address;
   console.log('新连接IP:', ip, 'SocketID:', socket.id);
 
-  // 判断是否为内网IP
-  function isPrivateIP(ip: string) {
-    return /^10\./.test(ip) ||
-           /^192\.168\./.test(ip) ||
-           /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip);
-  }
-  const groupKey = isPrivateIP(ip) ? 'LAN' : ip;
+  // 使用新的分组逻辑
+  const groupKey = getNetworkGroup(ip);
   if (!ipGroups.has(groupKey)) ipGroups.set(groupKey, new Set());
   ipGroups.get(groupKey)!.add(socket.id);
 
