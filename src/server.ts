@@ -11,6 +11,7 @@ interface DeviceInfo {
   type?: string;
   icon?: string;
   name?: string;
+  groupKey?: string;
 }
 
 const app = express();
@@ -38,8 +39,18 @@ function cleanupDevices() {
   const now = Date.now();
   for (const [id, device] of devices.entries()) {
     if (now - device.lastSeen > 30000) { // 30秒未活动则清理
+      // 从ipGroups中移除
+      if (device.groupKey) {
+        ipGroups.get(device.groupKey)?.delete(id);
+        if (ipGroups.get(device.groupKey)?.size === 0) {
+          ipGroups.delete(device.groupKey);
+        }
+        // 通知同组设备
+        ipGroups.get(device.groupKey)?.forEach(groupId => {
+          io.to(groupId).emit('device-left', { id });
+        });
+      }
       devices.delete(id);
-      io.emit('device-left', { id });
     }
   }
 }
@@ -105,7 +116,8 @@ io.on('connection', (socket) => {
   // 存储设备信息
   devices.set(socket.id, {
     id: socket.id,
-    lastSeen: Date.now()
+    lastSeen: Date.now(),
+    groupKey: groupKey
   });
 
   // 更新设备最后活动时间
@@ -124,15 +136,19 @@ io.on('connection', (socket) => {
       deviceInfo.type = data.type;
       deviceInfo.icon = data.icon;
       deviceInfo.name = data.name;
+      // 保持groupKey不变
+      deviceInfo.groupKey = deviceInfo.groupKey;
       // 只通知同组
-      ipGroups.get(groupKey)!.forEach(id => {
-        io.to(id).emit('device-info-update', {
-          id: socket.id,
-          type: data.type,
-          icon: data.icon,
-          name: data.name
+      if (deviceInfo.groupKey) {
+        ipGroups.get(deviceInfo.groupKey)!.forEach(id => {
+          io.to(id).emit('device-info-update', {
+            id: socket.id,
+            type: data.type,
+            icon: data.icon,
+            name: data.name
+          });
         });
-      });
+      }
     }
   });
 
@@ -223,13 +239,19 @@ io.on('connection', (socket) => {
   // 处理断开连接
   socket.on('disconnect', () => {
     console.log('设备已断开:', socket.id);
+    const device = devices.get(socket.id);
+    if (device) {
+      const groupKey = device.groupKey;
+      if (groupKey) {
+        ipGroups.get(groupKey)?.delete(socket.id);
+        if (ipGroups.get(groupKey)?.size === 0) ipGroups.delete(groupKey);
+        // 通知同组设备
+        ipGroups.get(groupKey)?.forEach(id => {
+          io.to(id).emit('device-left', { id: socket.id });
+        });
+      }
+    }
     devices.delete(socket.id);
-    ipGroups.get(groupKey)?.delete(socket.id);
-    if (ipGroups.get(groupKey)?.size === 0) ipGroups.delete(groupKey);
-    // 只通知同组
-    ipGroups.get(groupKey)?.forEach(id => {
-      io.to(id).emit('device-left', { id: socket.id });
-    });
   });
 });
 
