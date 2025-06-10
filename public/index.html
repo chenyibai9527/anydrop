@@ -8,6 +8,7 @@
   <meta name="keywords" content="文件传输,局域网传输,文件分享,无线传输,P2P传输">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💫</text></svg>">
   <script src="/socket.io/socket.io.js"></script>
+  <script src="https://unpkg.com/simple-peer@9.11.1/simplepeer.min.js"></script>
   <!-- 调试工具 -->
   <script>
     // 调试工具
@@ -20,6 +21,197 @@
     window.addEventListener('error', function(event) {
       debugLog('ERROR', '全局错误:', event.error);
       console.error(event.error);
+    });
+
+    // WebRTC 连接管理
+    const peerConnections = new Map();
+    const dataChannels = new Map();
+
+    // 创建 WebRTC 连接
+    function createPeerConnection(targetId, isInitiator = false) {
+      debugLog('WEBRTC', '创建连接', { targetId, isInitiator });
+      
+      const peer = new SimplePeer({
+        initiator: isInitiator,
+        trickle: false,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' }
+          ]
+        }
+      });
+
+      peer.on('signal', data => {
+        debugLog('WEBRTC', '发送信令数据', { targetId });
+        socket.emit('signal', { targetId, signal: data });
+      });
+
+      peer.on('connect', () => {
+        debugLog('WEBRTC', '连接已建立', { targetId });
+        if (isInitiator) {
+          createDataChannel(targetId, peer);
+        }
+      });
+
+      peer.on('error', err => {
+        debugLog('WEBRTC ERROR', '连接错误', { targetId, error: err });
+        socket.emit('p2p-failed', { targetId });
+      });
+
+      peerConnections.set(targetId, peer);
+      return peer;
+    }
+
+    // 创建数据通道
+    function createDataChannel(targetId, peer) {
+      debugLog('WEBRTC', '创建数据通道', { targetId });
+      
+      const dataChannel = peer.createDataChannel('fileTransfer');
+      setupDataChannel(dataChannel, targetId);
+      dataChannels.set(targetId, dataChannel);
+    }
+
+    // 设置数据通道事件处理
+    function setupDataChannel(dataChannel, targetId) {
+      dataChannel.onopen = () => {
+        debugLog('WEBRTC', '数据通道已打开', { targetId });
+      };
+
+      dataChannel.onclose = () => {
+        debugLog('WEBRTC', '数据通道已关闭', { targetId });
+        dataChannels.delete(targetId);
+      };
+
+      dataChannel.onerror = (error) => {
+        debugLog('WEBRTC ERROR', '数据通道错误', { targetId, error });
+      };
+
+      dataChannel.onmessage = (event) => {
+        handleDataChannelMessage(event.data, targetId);
+      };
+    }
+
+    // 处理数据通道消息
+    function handleDataChannelMessage(data, targetId) {
+      try {
+        const message = JSON.parse(data);
+        if (message.type === 'file-data') {
+          handleFileData(message, targetId);
+        }
+      } catch (error) {
+        debugLog('WEBRTC ERROR', '处理数据通道消息错误', { targetId, error });
+      }
+    }
+
+    // 处理文件数据
+    function handleFileData(message, targetId) {
+      const { transferId, chunk, offset, totalSize } = message;
+      
+      if (!fileReceivers.has(transferId)) {
+        debugLog('WEBRTC', '未找到接收状态，忽略数据', { transferId });
+        return;
+      }
+
+      const receiver = fileReceivers.get(transferId);
+      if (!receiver.active) {
+        debugLog('WEBRTC', '接收已停止，忽略数据', { transferId });
+        return;
+      }
+
+      receiver.chunks.push(chunk);
+      receiver.receivedSize += chunk.byteLength;
+
+      const progress = (receiver.receivedSize / receiver.fileSize) * 100;
+      updateReceiveProgressUI(transferId, progress);
+
+      if (Math.abs(receiver.receivedSize - receiver.fileSize) <= 1024) {
+        updateReceiveProgressUI(transferId, 100, 'completed');
+        saveReceivedFile(transferId);
+      }
+    }
+
+    // 修改文件传输请求处理
+    socket.on('file-transfer-request', async (data) => {
+      const { fromId, fileName, fileSize, transferId } = data;
+      
+      // 创建 WebRTC 连接（如果是接收方）
+      if (!peerConnections.has(fromId)) {
+        const peer = createPeerConnection(fromId, false);
+        peer.on('dataChannel', (dataChannel) => {
+          setupDataChannel(dataChannel, fromId);
+          dataChannels.set(fromId, dataChannel);
+        });
+      }
+
+      // 显示文件接收确认对话框
+      showFileReceiveConfirmDialog(fileName, fileSize, fromId, transferId);
+    });
+
+    // 修改文件传输响应处理
+    socket.on('file-transfer-response', (data) => {
+      const { fromId, transferId, accepted } = data;
+      
+      if (accepted) {
+        const dataChannel = dataChannels.get(fromId);
+        if (dataChannel && dataChannel.readyState === 'open') {
+          // 开始通过 WebRTC 发送文件
+          startFileTransfer(fromId, transferId);
+        } else {
+          debugLog('WEBRTC', '数据通道未就绪，等待连接建立', { fromId });
+        }
+      }
+    });
+
+    // 修改文件发送函数
+    async function startFileTransfer(targetId, transferId) {
+      const sender = fileSenders.get(transferId);
+      if (!sender) return;
+
+      const dataChannel = dataChannels.get(targetId);
+      if (!dataChannel || dataChannel.readyState !== 'open') {
+        debugLog('WEBRTC', '数据通道未就绪，无法发送文件', { targetId });
+        return;
+      }
+
+      const chunkSize = 16384; // 16KB chunks
+      let offset = 0;
+
+      while (offset < sender.file.size && sender.active) {
+        const chunk = sender.file.slice(offset, offset + chunkSize);
+        const arrayBuffer = await chunk.arrayBuffer();
+        
+        const message = {
+          type: 'file-data',
+          transferId,
+          chunk: arrayBuffer,
+          offset,
+          totalSize: sender.file.size
+        };
+
+        dataChannel.send(JSON.stringify(message));
+        offset += chunkSize;
+
+        const progress = (offset / sender.file.size) * 100;
+        updateSendProgressUI(transferId, progress);
+      }
+
+      if (sender.active) {
+        updateSendProgressUI(transferId, 100, 'completed');
+      }
+    }
+
+    // 处理 WebRTC 信令
+    socket.on('signal', (data) => {
+      const { fromId, signal } = data;
+      const peer = peerConnections.get(fromId) || createPeerConnection(fromId, false);
+      peer.signal(signal);
+    });
+
+    // 处理 P2P 连接失败
+    socket.on('p2p-failed', (data) => {
+      const { fromId, transferId } = data;
+      debugLog('WEBRTC', 'P2P 连接失败，回退到服务器中转', { fromId, transferId });
+      // 这里可以添加回退到服务器中转的逻辑
     });
   </script>
   <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
@@ -1144,8 +1336,8 @@
         aboutTitle: '关于 AnyDrop',
         appDescription: '一个简单、快速、无需安装的局域网文件传输工具。让您在同一网络下的设备间轻松分享文件。',
         versionInfo: '版本信息',
-        version: '版本: 1.0.0',
-        releaseDate: '发布日期: 2025年5月',
+        version: '版本: 1.0.1',
+        releaseDate: '发布日期: 2025年6月',
         techStack: '技术栈',
         techDescription: '本项目基于Web技术构建，使用Socket.io实现实时通信，无需额外安装任何软件。',
         openSource: '开源信息',
@@ -1236,8 +1428,8 @@
         aboutTitle: 'About AnyDrop',
         appDescription: 'A simple, fast, and installation-free LAN file transfer tool. Easily share files between devices on the same network.',
         versionInfo: 'Version Info',
-        version: 'Version: 1.0.0',
-        releaseDate: 'Release Date: May 2025',
+        version: 'Version: 1.0.1',
+        releaseDate: 'Release Date: June 2025',
         techStack: 'Technology Stack',
         techDescription: 'This project is built with web technologies, using Socket.io for real-time communication, requiring no additional software installation.',
         openSource: 'Open Source Info',
