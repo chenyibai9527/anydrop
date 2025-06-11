@@ -255,7 +255,7 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3030;
 
 // 获取本机IP地址
 function getLocalIP() {

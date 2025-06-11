@@ -3212,6 +3212,45 @@
       
       // 更新设备图标
       updateDeviceTypeIcon();
+
+      // 启动心跳检测
+      startHeartbeat();
+    });
+
+    // 心跳检测
+    function startHeartbeat() {
+      setInterval(() => {
+        if (socket.connected) {
+          socket.emit('heartbeat');
+          debugLog('HEARTBEAT', '发送心跳包');
+        } else {
+          debugLog('HEARTBEAT', '连接已断开，尝试重连');
+        }
+      }, 15000); // 每15秒发送一次心跳
+    }
+
+    // 连接状态监控
+    socket.on('disconnect', () => {
+      debugLog('DISCONNECT', '与服务器断开连接');
+    });
+
+    socket.on('reconnect', () => {
+      debugLog('RECONNECT', '重新连接到服务器');
+      // 重新发送设备信息
+      socket.emit('device-info', myDeviceInfo);
+    });
+
+    socket.on('reconnect_attempt', () => {
+      debugLog('RECONNECT', '尝试重新连接...');
+    });
+
+    socket.on('reconnect_error', (error) => {
+      debugLog('RECONNECT ERROR', '重连失败:', error);
+    });
+
+    socket.on('reconnect_failed', () => {
+      debugLog('RECONNECT ERROR', '重连失败，请刷新页面');
+      showNotification('连接已断开，请刷新页面');
     });
     
     socket.on('device-info', (data) => {
